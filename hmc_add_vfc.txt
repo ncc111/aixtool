@@ -1,0 +1,8 @@
+VIOS
+chhwres -r virtualio -m Server-9105-22A-A51 -o a --id 1 --rsubtype fc -s 151 -a "adapter_type=server,remote_lpar_name=DSB_AIX101,remote_slot_num=10"
+
+AI
+chhwres -r virtualio -m Server-9105-22A-A51 -o a --id 13 --rsubtype fc -s 10 -a "adapter_type=client,remote_lpar_name=viosa51a,remote_slot_num=151"
+
+AIX Spec
+chhwres -r virtualio -m Server-9105-22A-A51 -o a --id 13 --rsubtype fc -s 10 -a "adapter_type=client,remote_lpar_name=DSB_AIX101,remote_slot_num=151,\"wwpns=c050760833121111,c050760833121112\""
