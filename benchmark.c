@@ -10,7 +10,7 @@ int is_prime(int n) {
 }
 
 int main() {
-    int max_num = 10000000; // 10 Million
+    int max_num = 30000000; // 30 Million
     int count = 0;
     struct timeval start, end;
     
