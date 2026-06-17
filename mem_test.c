@@ -51,16 +51,18 @@ int main() {
     printf("[Sequential Write] Bandwidth:    %.2f GB/s\n", bandwidth);
 
     // ---------------------------------------------------
-    // Test 2: Sequential Read
+    // Test 2: Sequential Read (Fixed for accurate speed)
     // ---------------------------------------------------
-    // Using 'volatile' prevents the compiler from optimizing away the read loop
-    volatile uint64_t dummy_sum = 0; 
+    uint64_t local_sum = 0; // Standard variable, stays in CPU register
     
     start_time = get_time();
     for (size_t i = 0; i < num_elements; i++) {
-        dummy_sum += array[i];
+        local_sum += array[i];
     }
     end_time = get_time();
+
+    // Assign to volatile AFTER the loop to prevent dead-code elimination
+    volatile uint64_t dummy_sum = local_sum; 
 
     time_spent = end_time - start_time;
     bandwidth = ((double)TEST_SIZE_BYTES / (1024 * 1024 * 1024)) / time_spent;
