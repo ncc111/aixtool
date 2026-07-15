@@ -3,9 +3,10 @@
 # npiv_tree_html_diagram.sh - Interactive HTML NPIV Tree Diagram
 # Description: Generates a fully self-contained interactive HTML file showing
 #              NPIV (N_Port ID Virtualization) configuration tree on IBM VIOS.
-#              Layout: VIOS -> Physical FC Adapter -> vfchost -> Client Details
+#              Layout (VIOS view):  VIOS -> Physical FC Adapter -> vfchost -> LPAR
+#              Layout (LPAR view):  LPAR -> Virtual FC Adapter  -> vfchost -> Physical FC Port
 # Author: Bob
-# Version: 2.1
+# Version: 3.0
 #
 
 OUTPUT_DIR="/home/padmin"
@@ -55,12 +56,6 @@ collect_data() {
     # Fields: name:physloc:clntid:clntname:clntos:status:fcname:fcloc:ports:flags:vfc_client:vfc_client_drc
     /usr/ios/cli/ioscli lsmap -all -npiv -fmt : \
         2>/dev/null > "${TMP_PREFIX}_lsmap.tmp"
-
-    # ── Virtual WWPN note: stored in HMC LPAR profile, not on VIOS ───────────
-    # The virtual WWPN for each vfchost is defined in the HMC/PowerVC LPAR
-    # profile and is visible on the CLIENT LPAR (via lsattr -El fcsX on AIX).
-    # The alt_site_wwpn/current_wwpn lsattr fields are only set post-migration.
-    # We capture the physical WWPN (from fcstat) which is the backing port WWPN.
 }
 
 # ── HTML generation ───────────────────────────────────────────────────────────
@@ -90,17 +85,18 @@ while IFS=: read -r fname fphysloc ffabric ftports faports fswwpns fawwpns; do
                          vfcname vfcloc vports vflags vvfcclient vvfcdrc; do
         [ "$vfcname" = "$fname" ] || continue
 
-        # Virtual WWPN: lsattr format is "attribute  value  description  settable"
-        # alt_site_wwpn and current_wwpn are only set post-migration (value looks like 0x...)
-        # awk: match attribute col1, only return col2 if it starts with 0x (real WWPN)
+        # Virtual WWPN: check lsattr for alt_site_wwpn or current_wwpn
+        # These are only populated post-LPM migration; normally blank on VIOS
         vwwpn=$(lsattr -El "$vname" 2>/dev/null | awk '
             $1 == "alt_site_wwpn" && $2 ~ /^0x/ { print $2; exit }
             $1 == "current_wwpn"  && $2 ~ /^0x/ { print $2; exit }
         ')
-        # Fallback — virtual WWPN is stored in HMC/PowerVC LPAR profile, not on VIOS
-        if [ -z "$vwwpn" ]; then
-            vwwpn="Defined in HMC/LPAR profile (not stored on VIOS)"
-        fi
+        [ -z "$vwwpn" ] && vwwpn="N/A (defined in HMC LPAR profile)"
+
+        # Parse client virtual slot from VFC client DRC:
+        # DRC format: U<sys_type>-V<lpar_id>-C<slot>  e.g. U9009.42A.782D930-V106-C4
+        vslot=$(echo "$vvfcdrc" | sed 's/.*-C//')
+        [ -z "$vslot" ] && vslot="N/A"
 
         VFCHOST_JS="${VFCHOST_JS}
             {
@@ -113,6 +109,9 @@ while IFS=: read -r fname fphysloc ffabric ftports faports fswwpns fawwpns; do
               ports: '${vports}',
               vfc_client: '${vvfcclient}',
               vfc_client_drc: '${vvfcdrc}',
+              vfc_client_slot: '${vslot}',
+              phys_fc: '${vfcname}',
+              phys_fc_loc: '${vfcloc}',
               phys_wwpn: '${f_wwpn}',
               virt_wwpn: '${vwwpn}'
             },"
@@ -155,10 +154,16 @@ cat >> "${OUTPUT_FILE}" << 'STYLE_EOF'
   .subtitle { font-size: 0.8rem; color: #8892a4; margin-bottom: 16px; }
 
   /* Top bar */
-  .topbar { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 14px; margin-bottom: 26px; padding-bottom: 18px; border-bottom: 1px solid #22293a; }
+  .topbar { display: flex; align-items: flex-start; justify-content: space-between; flex-wrap: wrap; gap: 14px; margin-bottom: 20px; padding-bottom: 18px; border-bottom: 1px solid #22293a; }
   .info-pills { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
   .pill { background: #161d2e; border: 1px solid #252e45; border-radius: 4px; padding: 3px 10px; font-size: 0.73rem; color: #7a87a3; }
   .pill span { color: #c0ccdf; font-weight: 600; }
+
+  /* View toggle tabs */
+  .view-tabs { display: flex; gap: 0; margin-bottom: 20px; border-bottom: 2px solid #1e2840; }
+  .view-tab { padding: 8px 22px; font-family: 'IBM Plex Sans', 'Segoe UI', sans-serif; font-size: 0.8rem; font-weight: 600; color: #5a6880; cursor: pointer; border: 1px solid transparent; border-bottom: none; border-radius: 4px 4px 0 0; margin-bottom: -2px; transition: background 0.12s, color 0.12s; letter-spacing: 0.03em; }
+  .view-tab:hover { background: #161d2e; color: #9aafcc; }
+  .view-tab.active { background: #131b30; border-color: #1e2840; color: #7eaaee; border-bottom-color: #131b30; }
 
   /* Expand/Collapse buttons */
   .btn-group { display: flex; gap: 8px; padding-top: 4px; }
@@ -167,6 +172,8 @@ cat >> "${OUTPUT_FILE}" << 'STYLE_EOF'
 
   /* Tree wrapper */
   .tree { padding: 4px 0; }
+  .tree-view { display: none; }
+  .tree-view.active { display: block; }
 
   /* Generic node */
   .node { margin: 1px 0; }
@@ -182,6 +189,8 @@ cat >> "${OUTPUT_FILE}" << 'STYLE_EOF'
   .tag-vios    { background: #0e2050; color: #6faaff; border: 1px solid #1e4aaa; }
   .tag-fc      { background: #3a2200; color: #f0a020; border: 1px solid #7a4800; }
   .tag-vfchost { background: #082b1a; color: #3acc70; border: 1px solid #136630; }
+  .tag-lpar    { background: #2a0e40; color: #c480ff; border: 1px solid #6030a0; }
+  .tag-vfc     { background: #0d2535; color: #40c4ff; border: 1px solid #0a5070; }
 
   .node-label { font-size: 0.85rem; font-weight: 600; color: #ccd4ec; }
   .node-meta  { font-size: 0.73rem; color: #5a6680; }
@@ -230,9 +239,16 @@ cat >> "${OUTPUT_FILE}" << TOPBAR_EOF
   </div>
 </div>
 
-<div class="tree" id="tree-root"></div>
+<!-- View tabs -->
+<div class="view-tabs">
+  <div class="view-tab active" onclick="switchView('vios')">&#128200;&nbsp; VIOS View</div>
+  <div class="view-tab"       onclick="switchView('lpar')">&#128202;&nbsp; LPAR View</div>
+</div>
 
-<footer>Made with IBM Bob &nbsp;&bull;&nbsp; NPIV Tree HTML Diagram v2.1 &nbsp;&bull;&nbsp; ${VIOS_HOSTNAME}</footer>
+<div id="view-vios" class="tree-view active" id="tree-vios"></div>
+<div id="view-lpar" class="tree-view"        id="tree-lpar"></div>
+
+<footer>Made with IBM Bob &nbsp;&bull;&nbsp; NPIV Tree HTML Diagram v3.0 &nbsp;&bull;&nbsp; ${VIOS_HOSTNAME}</footer>
 TOPBAR_EOF
 
 # JavaScript data block + rendering logic
@@ -278,58 +294,115 @@ function tog(id) {
   if (n) n.classList.toggle('open');
 }
 
-function expandAll()  { var ns = document.querySelectorAll('.node'); for (var i=0;i<ns.length;i++) ns[i].classList.add('open'); }
-function collapseAll(){ var ns = document.querySelectorAll('.node'); for (var i=0;i<ns.length;i++) ns[i].classList.remove('open'); }
+function expandAll() {
+  var root = document.querySelector('.tree-view.active');
+  var ns = root ? root.querySelectorAll('.node') : [];
+  for (var i = 0; i < ns.length; i++) ns[i].classList.add('open');
+}
+
+function collapseAll() {
+  var root = document.querySelector('.tree-view.active');
+  var ns = root ? root.querySelectorAll('.node') : [];
+  for (var i = 0; i < ns.length; i++) ns[i].classList.remove('open');
+}
+
+/* ── View switching ─────────────────────────────────────────────────────── */
+function switchView(name) {
+  var views = document.querySelectorAll('.tree-view');
+  var tabs  = document.querySelectorAll('.view-tab');
+  for (var i = 0; i < views.length; i++) views[i].classList.remove('active');
+  for (var i = 0; i < tabs.length;  i++) tabs[i].classList.remove('active');
+  document.getElementById('view-' + name).classList.add('active');
+  var idx = (name === 'vios') ? 0 : 1;
+  tabs[idx].classList.add('active');
+}
 
 /* ── Panel builders ─────────────────────────────────────────────────────── */
 function fcPanel(a) {
   return '<div class="panel"><table>' +
     sec('Physical FC Adapter — Identity') +
-    r('Adapter Name',              a.name) +
-    r('FC Location Code',          a.physloc) +
+    r('Adapter Name',                a.name) +
+    r('FC Location Code',            a.physloc) +
     r('World Wide Node Name (WWNN)', a.wwnn) +
     r('World Wide Port Name (WWPN)', a.wwpn) +
-    r('Port FC ID',                a.fcid) +
+    r('Port FC ID',                  a.fcid) +
     sec('Port Speed') +
-    r('Port Speed (running)',      a.speed_run) +
-    r('Port Speed (supported)',    a.speed_sup) +
+    r('Port Speed (running)',        a.speed_run) +
+    r('Port Speed (supported)',      a.speed_sup) +
     sec('Fabric / Capacity') +
-    r('Fabric',                    a.fabric) +
-    r('Total Ports',               a.tports) +
-    r('Available Ports',           a.aports) +
-    r('Switch WWPNs (total)',      a.swwpns) +
-    r('Switch WWPNs (available)',  a.awwpns) +
+    r('Fabric',                      a.fabric) +
+    r('Total Ports',                 a.tports) +
+    r('Available Ports',             a.aports) +
+    r('Switch WWPNs (total)',        a.swwpns) +
+    r('Switch WWPNs (available)',    a.awwpns) +
     '</table></div>';
 }
 
 function vfcPanel(v) {
   return '<div class="panel"><table>' +
     sec('Virtual FC Host — Identity') +
-    r('vfchost Name',                    v.name) +
-    r('DRC / Physical Location',         v.physloc) +
-    sec('Client Partition') +
-    r('Client ID',                       v.clntid) +
-    r('Client Name',                     v.clntname) +
-    r('Client OS',                       v.clntos) +
+    r('vfchost Name',                      v.name) +
+    r('DRC / Physical Location',           v.physloc) +
+    sec('Backing Physical FC Port') +
+    r('Physical FC Adapter',               v.phys_fc) +
+    r('Physical FC Location Code',         v.phys_fc_loc) +
+    r('Physical WWPN (backing fcs port)',  v.phys_wwpn) +
     sec('Connection Status') +
-    rh('Status',                         badge(v.status)) +
-    r('Ports Logged In',                 v.ports) +
-    sec('Client Adapter Mapping') +
-    r('VFC Client Name (Client Adapter)', v.vfc_client) +
-    r('VFC Client DRC',                  v.vfc_client_drc) +
-    sec('World Wide Port Names') +
-    r('Physical WWPN (backing fcs port)', v.phys_wwpn) +
-    r('Virtual WWPN (HMC LPAR profile)', v.virt_wwpn) +
+    rh('Status',                           badge(v.status)) +
+    r('Ports Logged In',                   v.ports) +
     '</table></div>';
 }
 
-/* ── Tree builder ───────────────────────────────────────────────────────── */
-function buildTree() {
+function lparPanel(v) {
+  return '<div class="panel"><table>' +
+    sec('Client LPAR — Identity') +
+    r('LPAR ID',                           v.clntid) +
+    r('LPAR Name',                         v.clntname) +
+    r('Operating System',                  v.clntos) +
+    sec('Client Virtual FC Adapter') +
+    r('Virtual FC Adapter Name',           v.vfc_client) +
+    r('Virtual Slot Number',               v.vfc_client_slot) +
+    r('VFC Client DRC Location Code',      v.vfc_client_drc) +
+    r('Virtual WWPN',                      v.virt_wwpn) +
+    sec('VIOS Mapping') +
+    r('VIOS vfchost',                      v.name) +
+    r('VIOS vfchost DRC',                  v.physloc) +
+    rh('Link Status',                      badge(v.status)) +
+    r('FC Ports Logged In',                v.ports) +
+    sec('Physical FC Path (VIOS → SAN)') +
+    r('Physical FC Adapter',               v.phys_fc) +
+    r('Physical FC Location Code',         v.phys_fc_loc) +
+    r('Physical WWPN (SAN-facing port)',   v.phys_wwpn) +
+    '</table></div>';
+}
+
+function vfcLparPanel(v) {
+  return '<div class="panel"><table>' +
+    sec('Virtual FC Adapter — LPAR Side') +
+    r('Virtual FC Adapter Name',           v.vfc_client) +
+    r('Virtual Slot Number',               v.vfc_client_slot) +
+    r('VFC Client DRC Location Code',      v.vfc_client_drc) +
+    r('Virtual WWPN',                      v.virt_wwpn) +
+    sec('VIOS Mapping') +
+    r('VIOS vfchost',                      v.name) +
+    r('VIOS vfchost DRC',                  v.physloc) +
+    rh('Link Status',                      badge(v.status)) +
+    r('FC Ports Logged In',                v.ports) +
+    sec('Physical FC Path (VIOS → SAN)') +
+    r('Physical FC Adapter',               v.phys_fc) +
+    r('Physical FC Location Code',         v.phys_fc_loc) +
+    r('Physical WWPN (SAN-facing port)',   v.phys_wwpn) +
+    '</table></div>';
+}
+
+/* ── VIOS View builder ──────────────────────────────────────────────────── */
+/* Tree: VIOS → Physical FC Adapter → vfchost → LPAR                        */
+function buildViosView() {
   var h = '';
 
   /* VIOS root */
-  h += '<div class="node open" id="n-vios">';
-  h += '<div class="node-header" onclick="tog(\'n-vios\')">';
+  h += '<div class="node open" id="v-vios">';
+  h += '<div class="node-header" onclick="tog(\'v-vios\')">';
   h += '<span class="tri">&#9654;</span>';
   h += '<span class="tag tag-vios">VIOS</span>';
   h += '<span class="node-label">' + esc(DATA.hostname) + '</span>';
@@ -338,7 +411,7 @@ function buildTree() {
 
   for (var ai = 0; ai < DATA.adapters.length; ai++) {
     var a = DATA.adapters[ai];
-    var fid = 'n-fc-' + ai;
+    var fid = 'v-fc-' + ai;
 
     /* Physical FC adapter */
     h += '<div class="node" id="' + fid + '">';
@@ -346,35 +419,145 @@ function buildTree() {
     h += '<span class="tri">&#9654;</span>';
     h += '<span class="tag tag-fc">FC Adapter</span>';
     h += '<span class="node-label">' + esc(a.name) + '</span>';
-    h += '<span class="node-meta">&nbsp;&nbsp;' + esc(a.physloc) + '</span>';
+    h += '<span class="node-meta">&nbsp;&nbsp;' + esc(a.physloc) + '&nbsp;&nbsp;WWPN: ' + esc(a.wwpn) + '</span>';
     h += '</div><div class="node-children">';
     h += fcPanel(a);
 
     /* vfchost nodes under this FC adapter */
     for (var vi = 0; vi < a.vfchosts.length; vi++) {
-      var v  = a.vfchosts[vi];
-      var vid = 'n-vfc-' + ai + '-' + vi;
+      var v   = a.vfchosts[vi];
+      var vid = 'v-vfc-' + ai + '-' + vi;
 
       h += '<div class="node" id="' + vid + '">';
       h += '<div class="node-header" onclick="tog(\'' + vid + '\')">';
       h += '<span class="tri">&#9654;</span>';
       h += '<span class="tag tag-vfchost">vfchost</span>';
       h += '<span class="node-label">' + esc(v.name) + '</span>';
-      h += '<span class="node-meta">&nbsp;&nbsp;' + esc(v.clntname) + ' &nbsp;(ID: ' + esc(v.clntid) + ', ' + esc(v.clntos) + ')</span>';
+      h += '<span class="node-meta">&nbsp;&nbsp;' + esc(v.physloc) + '</span>';
       h += '&nbsp;&nbsp;' + badge(v.status);
       h += '</div><div class="node-children">';
       h += vfcPanel(v);
-      h += '</div></div>';
+
+      /* LPAR leaf node */
+      var lid = 'v-lpar-' + ai + '-' + vi;
+      h += '<div class="node" id="' + lid + '">';
+      h += '<div class="node-header" onclick="tog(\'' + lid + '\')">';
+      h += '<span class="tri">&#9654;</span>';
+      h += '<span class="tag tag-lpar">LPAR</span>';
+      h += '<span class="node-label">' + esc(v.clntname) + '</span>';
+      h += '<span class="node-meta">&nbsp;&nbsp;ID: ' + esc(v.clntid) +
+           ' &nbsp;&bull;&nbsp; OS: ' + esc(v.clntos) +
+           ' &nbsp;&bull;&nbsp; vfc: ' + esc(v.vfc_client) +
+           ' (slot ' + esc(v.vfc_client_slot) + ')</span>';
+      h += '</div><div class="node-children">';
+      h += lparPanel(v);
+      h += '</div></div>'; /* close LPAR */
+
+      h += '</div></div>'; /* close vfchost children + node */
     }
 
     h += '</div></div>'; /* close FC children + FC node */
   }
 
   h += '</div></div>'; /* close VIOS children + VIOS node */
-  document.getElementById('tree-root').innerHTML = h;
+  document.getElementById('view-vios').innerHTML = h;
 }
 
-buildTree();
+/* ── LPAR View builder ──────────────────────────────────────────────────── */
+/* Tree: LPAR → Virtual FC Adapter → vfchost (VIOS) → Physical FC Port      */
+function buildLparView() {
+  /* Collect all vfchost entries grouped by LPAR ID */
+  var lpars = {}; /* key: clntid, val: { id, name, os, vfcs: [] } */
+
+  for (var ai = 0; ai < DATA.adapters.length; ai++) {
+    var a = DATA.adapters[ai];
+    for (var vi = 0; vi < a.vfchosts.length; vi++) {
+      var v = a.vfchosts[vi];
+      var key = v.clntid + '|' + v.clntname;
+      if (!lpars[key]) {
+        lpars[key] = { id: v.clntid, name: v.clntname, os: v.clntos, vfcs: [] };
+      }
+      lpars[key].vfcs.push(v);
+    }
+  }
+
+  var h = '';
+  var lkeys = Object.keys(lpars).sort(function(a,b){
+    return parseInt(lpars[a].id||0) - parseInt(lpars[b].id||0);
+  });
+
+  for (var li = 0; li < lkeys.length; li++) {
+    var lp  = lpars[lkeys[li]];
+    var lpid = 'l-lpar-' + li;
+
+    /* LPAR root */
+    h += '<div class="node open" id="' + lpid + '">';
+    h += '<div class="node-header" onclick="tog(\'' + lpid + '\')">';
+    h += '<span class="tri">&#9654;</span>';
+    h += '<span class="tag tag-lpar">LPAR</span>';
+    h += '<span class="node-label">' + esc(lp.name) + '</span>';
+    h += '<span class="node-meta">&nbsp;&nbsp;ID: ' + esc(lp.id) + ' &nbsp;&bull;&nbsp; OS: ' + esc(lp.os) + '</span>';
+    h += '</div><div class="node-children">';
+
+    for (var vj = 0; vj < lp.vfcs.length; vj++) {
+      var v   = lp.vfcs[vj];
+      var vfid = 'l-vfc-' + li + '-' + vj;
+
+      /* Virtual FC adapter */
+      h += '<div class="node" id="' + vfid + '">';
+      h += '<div class="node-header" onclick="tog(\'' + vfid + '\')">';
+      h += '<span class="tri">&#9654;</span>';
+      h += '<span class="tag tag-vfc">Virtual FC</span>';
+      h += '<span class="node-label">' + esc(v.vfc_client) + '</span>';
+      h += '<span class="node-meta">&nbsp;&nbsp;slot ' + esc(v.vfc_client_slot) +
+           ' &nbsp;&bull;&nbsp; DRC: ' + esc(v.vfc_client_drc) + '</span>';
+      h += '</div><div class="node-children">';
+      h += vfcLparPanel(v);
+
+      /* vfchost (VIOS) */
+      var vhid = 'l-vfch-' + li + '-' + vj;
+      h += '<div class="node" id="' + vhid + '">';
+      h += '<div class="node-header" onclick="tog(\'' + vhid + '\')">';
+      h += '<span class="tri">&#9654;</span>';
+      h += '<span class="tag tag-vfchost">vfchost</span>';
+      h += '<span class="node-label">' + esc(v.name) + '</span>';
+      h += '<span class="node-meta">&nbsp;&nbsp;VIOS: ' + esc(DATA.hostname) +
+           ' &nbsp;&bull;&nbsp; ' + esc(v.physloc) + '</span>';
+      h += '&nbsp;&nbsp;' + badge(v.status);
+      h += '</div><div class="node-children">';
+      h += vfcPanel(v);
+
+      /* Physical FC Adapter leaf */
+      var pfid = 'l-fc-' + li + '-' + vj;
+      h += '<div class="node" id="' + pfid + '">';
+      h += '<div class="node-header" onclick="tog(\'' + pfid + '\')">';
+      h += '<span class="tri">&#9654;</span>';
+      h += '<span class="tag tag-fc">FC Adapter</span>';
+      h += '<span class="node-label">' + esc(v.phys_fc) + '</span>';
+      h += '<span class="node-meta">&nbsp;&nbsp;' + esc(v.phys_fc_loc) +
+           ' &nbsp;&bull;&nbsp; WWPN: ' + esc(v.phys_wwpn) + '</span>';
+      h += '</div><div class="node-children">';
+      /* FC detail panel — find full adapter record */
+      for (var ak = 0; ak < DATA.adapters.length; ak++) {
+        if (DATA.adapters[ak].name === v.phys_fc) {
+          h += fcPanel(DATA.adapters[ak]);
+          break;
+        }
+      }
+      h += '</div></div>'; /* close FC leaf */
+
+      h += '</div></div>'; /* close vfchost children + node */
+      h += '</div></div>'; /* close Virtual FC children + node */
+    }
+
+    h += '</div></div>'; /* close LPAR children + node */
+  }
+
+  document.getElementById('view-lpar').innerHTML = h;
+}
+
+buildViosView();
+buildLparView();
 </script>
 </body>
 </html>
@@ -393,14 +576,18 @@ Generates a self-contained interactive HTML NPIV tree diagram for VIOS.
 
 Output: ${OUTPUT_DIR}/npiv_tree_YYYYMMDD_HHMMSS.html
 
-Tree layout:
-  [VIOS]  vios_usb  (blue)
-  └── [FC Adapter]  fcs0 / fcs1  (amber)
-      │   WWNN, WWPN, Port FC ID, Speed, Location, Fabric, Available Ports
-      └── [vfchost]  vfchostN  (green)
-              Client ID, Client Name, OS, Status, Ports Logged In
-              VFC Client Name, VFC Client DRC
-              Physical WWPN (fcs backing port), Virtual WWPN (HMC profile)
+VIOS View tree layout:
+  [VIOS]       vios_usb  (blue)
+  └── [FC Adapter]  fcs0 / fcs1  (amber) — WWNN, WWPN, Speed, Fabric info
+      └── [vfchost]  vfchostN  (green)  — backing port, status, ports
+          └── [LPAR]  <client name>  (purple) — LPAR ID, OS, virtual fc adapter,
+                slot, DRC, virtual WWPN, full physical FC path
+
+LPAR View tree layout:
+  [LPAR]       <client name>  (purple)
+  └── [Virtual FC]  fcsN (client adapter)  (cyan) — slot, DRC, virtual WWPN
+      └── [vfchost]  vfchostN (VIOS)  (green) — status, ports logged in
+          └── [FC Adapter]  fcsN (VIOS physical)  (amber) — WWPN, speed, fabric
 
 Requires: Root access; VIOS NPIV configuration; fcstat, lsnports, lsmap
 EOF
